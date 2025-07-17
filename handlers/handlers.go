@@ -34,7 +34,12 @@ func QueryCVHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Received query: %s", query)
 
-	ragResponse, err := agents.ResumeAgent(query)
+	ragResponse, statusCode, err := agents.ResumeAgent(query)
+	if statusCode == http.StatusTooManyRequests {
+		http.Error(w, "Too Many Request", http.StatusTooManyRequests)
+		return
+	}
+
 	if err != nil {
 		log.Printf("Error calling Resume Agent: %v", err)
 		http.Error(w, fmt.Sprintf("Error processing request: %v", err), http.StatusInternalServerError)
