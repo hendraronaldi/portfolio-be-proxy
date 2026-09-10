@@ -2,42 +2,55 @@ package agents
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"time"
 
 	"portfolio-be-proxy/config"
-	models_agents "portfolio-be-proxy/models/agents"
 )
 
-func ResumeAgent(query string) (models_agents.ResumeAgentResponse, int, error) {
-	var responseBody models_agents.ResumeAgentResponse
+// 60s generation budget: upstream RAG generation may take up to 60s.
+var agentClient = &http.Client{Timeout: 60 * time.Second}
+
+func requireBackendURL() error {
 	if config.Config.ResumeAgentURL == "" {
-		return responseBody, 500, fmt.Errorf("RESUME_AGENT_URL is not set")
+		return fmt.Errorf("RESUME_AGENT_URL is not set")
 	}
+	return nil
+}
 
-	requestBody, err := json.Marshal(models_agents.ResumeAgentRequest{
-		Query: query,
-	})
-	if err != nil {
-		return responseBody, 500, fmt.Errorf("failed to marshal request body: %w", err)
+func postRaw(path string, rawBody []byte, userID, sessionID string) (int, []byte, http.Header, error) {
+	if err := requireBackendURL(); err != nil {
+		return 500, nil, nil, err
 	}
-
-	resp, err := http.Post(config.Config.ResumeAgentURL+"/query-resume", "application/json", bytes.NewBuffer(requestBody))
+	req, err := http.NewRequest("POST", config.Config.ResumeAgentURL+path, bytes.NewReader(rawBody))
 	if err != nil {
-		return responseBody, resp.StatusCode, fmt.Errorf("failed to call Resume Agent: %w", err)
+		return 500, nil, nil, fmt.Errorf("failed to build upstream request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if userID != "" {
+		req.Header.Set("X-User-Id", userID)
+	}
+	if sessionID != "" {
+		req.Header.Set("X-Session-Id", sessionID)
+	}
+	resp, err := agentClient.Do(req)
+	if err != nil {
+		return 500, nil, nil, fmt.Errorf("failed to call upstream: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := ioutil.ReadAll(resp.Body)
-		return responseBody, resp.StatusCode, fmt.Errorf("Resume Agent returned non-200 status: %d, body: %s", resp.StatusCode, string(bodyBytes))
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 500, nil, resp.Header, fmt.Errorf("failed to read upstream response: %w", err)
 	}
+	return resp.StatusCode, bodyBytes, resp.Header, nil
+}
 
-	if err := json.NewDecoder(resp.Body).Decode(&responseBody); err != nil {
-		return responseBody, resp.StatusCode, fmt.Errorf("failed to decode Resume Agent response: %w", err)
-	}
+func ResumeAgent(rawBody []byte, userID, sessionID string) (int, []byte, http.Header, error) {
+	return postRaw("/query-resume/", rawBody, userID, sessionID)
+}
 
-	return responseBody, resp.StatusCode, nil
+func FeedbackAgent(rawBody []byte, userID, sessionID string) (int, []byte, http.Header, error) {
+	return postRaw("/feedback/", rawBody, userID, sessionID)
 }
