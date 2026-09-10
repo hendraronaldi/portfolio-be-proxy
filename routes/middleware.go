@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"crypto/rand"
+	"fmt"
 	"log"
 	"net/http"
 	"portfolio-be-proxy/config"
@@ -13,18 +15,14 @@ import (
 
 const (
 	rateLimitPeriod      = 1 * time.Minute
-	rateLimitMaxRequests = 8
+	rateLimitMaxRequests = 60
+	maxPayloadBytes      = 65536
 )
 
 var (
-	mu            sync.Mutex
-	requestCounts int
-	lastResetTime time.Time
+	rateMu   sync.Mutex
+	rateHits = make(map[string][]time.Time)
 )
-
-func init() {
-	lastResetTime = time.Now()
-}
 
 type statusRecorder struct {
 	http.ResponseWriter
@@ -76,11 +74,11 @@ func ConfigureCors(router http.Handler, frontendOrigin string) http.Handler {
 		// CRUCIAL: List all non-standard headers your frontend sends.
 		// "Content-Type" is often needed for JSON POST requests.
 		// "X-API-Key" is your custom header, so it MUST be included here.
-		AllowedHeaders: []string{"Content-Type", "X-API-Key"},
+		AllowedHeaders: []string{"Content-Type", "X-API-Key", "X-User-Id", "X-Session-Id"},
 
 		// ExposedHeaders:
 		// (Optional) Headers that the browser is allowed to read from the response.
-		// ExposedHeaders: []string{"Link"},
+		ExposedHeaders: []string{"X-Session-Id", "X-Index-Build-Date"},
 
 		// AllowCredentials:
 		// Set to true if your frontend sends credentials like cookies, HTTP authentication,
@@ -104,30 +102,86 @@ func ConfigureCors(router http.Handler, frontendOrigin string) http.Handler {
 	return c.Handler(router)
 }
 
-func globalRateLimitMiddleware(next http.Handler) http.Handler {
+func payloadLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		if time.Since(lastResetTime) > rateLimitPeriod {
-			requestCounts = 0
-			lastResetTime = time.Now()
-		}
-
-		requestCounts++
-
-		if requestCounts > rateLimitMaxRequests {
-			log.Println("Global Rate limit exceeded")
-			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		if r.Method == "OPTIONS" {
+			next.ServeHTTP(w, r)
 			return
 		}
-
+		if r.ContentLength > maxPayloadBytes {
+			http.Error(w, "payload exceeds raw byte limit", http.StatusRequestEntityTooLarge)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxPayloadBytes)
 		next.ServeHTTP(w, r)
 	})
 }
 
-func apiKeyMiddleware(next http.Handler) http.Handler {
+func perKeyRateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		key := r.Header.Get("X-API-Key")
+		if key == "" {
+			key = getClientIP(r)
+		}
+		now := time.Now()
+		cutoff := now.Add(-rateLimitPeriod)
+		rateMu.Lock()
+		hits := rateHits[key]
+		kept := make([]time.Time, 0, len(hits)+1)
+		for _, t := range hits {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(rateHits, key)
+		} else if len(kept) >= rateLimitMaxRequests {
+			rateHits[key] = kept
+			rateMu.Unlock()
+			log.Println("Per-key rate limit exceeded")
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+		rateHits[key] = append(kept, now)
+		rateMu.Unlock()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func newSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func sessionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sid := r.Header.Get("X-Session-Id")
+		if sid == "" {
+			sid = newSessionID()
+		}
+		if sid != "" {
+			r.Header.Set("X-Session-Id", sid)
+			w.Header().Set("X-Session-Id", sid)
+		}
+		if r.Method == "OPTIONS" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func apiKeyMiddleware(next http.Handler) http.Handler {	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			log.Println("APIKeyMiddleware: Skipping API key check for OPTIONS preflight request.")
 			next.ServeHTTP(w, r)

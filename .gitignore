@@ -1,3 +1,6 @@
 *.env
 *.env.production
+*.env.example
 cloudbuild.yaml
+*.py
+__pycache__

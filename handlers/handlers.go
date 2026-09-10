@@ -1,64 +1,114 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 
 	"portfolio-be-proxy/handlers/agents"
+	models_agents "portfolio-be-proxy/models/agents"
 )
 
-func QueryCVHandler(w http.ResponseWriter, r *http.Request) {
+const payloadTooLargeMsg = "payload exceeds raw byte limit"
+
+func requirePost(w http.ResponseWriter, r *http.Request) bool {
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
-		return
+		return true
 	}
-
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return true
+	}
+	return false
+}
+
+func isBodyTooLarge(err error) bool {
+	var maxErr *http.MaxBytesError
+	return errors.As(err, &maxErr)
+}
+
+func readRawBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		if isBodyTooLarge(err) {
+			http.Error(w, payloadTooLargeMsg, http.StatusRequestEntityTooLarge)
+			return nil, false
+		}
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return nil, false
+	}
+	return rawBody, true
+}
+
+func forwardBuildDate(w http.ResponseWriter, header http.Header) {
+	if header != nil {
+		if buildDate := header.Get("X-Index-Build-Date"); buildDate != "" {
+			w.Header().Set("X-Index-Build-Date", buildDate)
+		}
+	}
+}
+
+func forwardSessionID(w http.ResponseWriter, r *http.Request) {
+	if sid := r.Header.Get("X-Session-Id"); sid != "" {
+		w.Header().Set("X-Session-Id", sid)
+	}
+}
+
+func QueryCVHandler(w http.ResponseWriter, r *http.Request) {
+	if requirePost(w, r) {
 		return
 	}
-
-	var requestBody map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+	rawBody, ok := readRawBody(w, r)
+	if !ok {
+		return
+	}
+	var probe models_agents.ResumeAgentRequest
+	if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&probe); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-
-	query, ok := requestBody["query"].(string)
-	if !ok || query == "" {
-		http.Error(w, "Missing 'query' in request body", http.StatusBadRequest)
+	if probe.Query == "" {
+		http.Error(w, "Missing 'query'", http.StatusBadRequest)
 		return
 	}
-
-	log.Printf("Received query: %s", query)
-
-	ragResponse, statusCode, err := agents.ResumeAgent(query)
-	if statusCode == http.StatusTooManyRequests {
-		http.Error(w, "Too Many Request", http.StatusTooManyRequests)
-		return
-	}
-
+	statusCode, upstreamBody, header, err := agents.ResumeAgent(rawBody, r.Header.Get("X-User-Id"), r.Header.Get("X-Session-Id"))
 	if err != nil {
 		log.Printf("Error calling Resume Agent: %v", err)
-		http.Error(w, fmt.Sprintf("Error processing request: %v", err), http.StatusInternalServerError)
+		http.Error(w, "Error processing request", http.StatusInternalServerError)
 		return
 	}
-
-	resp, err := json.Marshal(ragResponse)
-	if err != nil {
-		log.Printf("Error marshalling response: %v", err)
-		http.Error(w, "Error processing response", http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write(resp); err != nil {
+	forwardBuildDate(w, header)
+	forwardSessionID(w, r)
+	w.WriteHeader(statusCode)
+	if _, err := w.Write(upstreamBody); err != nil {
 		log.Printf("Error writing response: %v", err)
-		http.Error(w, "Error writing response", http.StatusInternalServerError)
+	}
+}
+
+func FeedbackHandler(w http.ResponseWriter, r *http.Request) {
+	if requirePost(w, r) {
 		return
 	}
-	log.Printf("Response sent successfully for query: %s", query)
+	rawBody, ok := readRawBody(w, r)
+	if !ok {
+		return
+	}
+	statusCode, upstreamBody, header, err := agents.FeedbackAgent(rawBody, r.Header.Get("X-User-Id"), r.Header.Get("X-Session-Id"))
+	if err != nil {
+		log.Printf("Error calling Feedback endpoint: %v", err)
+		http.Error(w, "Error processing request", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	forwardBuildDate(w, header)
+	forwardSessionID(w, r)
+	w.WriteHeader(statusCode)
+	if _, err := w.Write(upstreamBody); err != nil {
+		log.Printf("Error writing feedback response: %v", err)
+	}
 }
